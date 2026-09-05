@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -655,6 +656,19 @@ func handleGet(args []string) {
 		colorReset,
 	)
 
+	isZIP := strings.EqualFold(
+		filepath.Ext(manifest.Binary),
+		".zip",
+	)
+
+	if isZIP {
+		fmt.Printf(
+			"Type: %sZIP archive%s\n",
+			colorCyan,
+			colorReset,
+		)
+	}
+
 	fmt.Println()
 
 	binaryURL := registryPackageURL(
@@ -807,20 +821,60 @@ func handleGet(args []string) {
 		return
 	}
 
-	installedBinary := filepath.Join(
-		installDir,
-		manifest.Binary,
-	)
+	// --------------------------------------------------------
+	// ZIP INSTALLATION
+	// --------------------------------------------------------
 
-	if err := copyFileWithProgress(
-		tempBinary,
-		installedBinary,
-	); err != nil {
-		errorf(
-			"install package: %v",
-			err,
+	if isZIP {
+		stopProgress = startIndeterminateProgress(
+			"Extracting ZIP package...",
 		)
-		return
+
+		err := extractZIPSecurely(
+			tempBinary,
+			installDir,
+		)
+
+		stopProgress()
+
+		if err != nil {
+			errorf(
+				"extract ZIP package: %v",
+				err,
+			)
+
+			warningf(
+				"The ZIP package was verified but could not be extracted.",
+			)
+
+			return
+		}
+
+		successf(
+			"ZIP package extracted.",
+		)
+
+	} else {
+
+		// ----------------------------------------------------
+		// NORMAL FILE INSTALLATION
+		// ----------------------------------------------------
+
+		installedBinary := filepath.Join(
+			installDir,
+			manifest.Binary,
+		)
+
+		if err := copyFileWithProgress(
+			tempBinary,
+			installedBinary,
+		); err != nil {
+			errorf(
+				"install package: %v",
+				err,
+			)
+			return
+		}
 	}
 
 	manifestPath := filepath.Join(
@@ -838,7 +892,14 @@ func handleGet(args []string) {
 			err,
 		)
 
-		_ = os.Remove(installedBinary)
+		if !isZIP {
+			_ = os.Remove(
+				filepath.Join(
+					installDir,
+					manifest.Binary,
+				),
+			)
+		}
 
 		return
 	}
@@ -858,7 +919,15 @@ func handleGet(args []string) {
 			err,
 		)
 
-		_ = os.Remove(installedBinary)
+		if !isZIP {
+			_ = os.Remove(
+				filepath.Join(
+					installDir,
+					manifest.Binary,
+				),
+			)
+		}
+
 		_ = os.Remove(manifestPath)
 
 		return
@@ -901,6 +970,14 @@ func handleGet(args []string) {
 		colorReset,
 	)
 
+	if isZIP {
+		fmt.Printf(
+			"Type: %sZIP archive%s\n",
+			colorCyan,
+			colorReset,
+		)
+	}
+
 	fmt.Printf(
 		"Location: %s%s%s\n",
 		colorCyan,
@@ -927,6 +1004,229 @@ func handleGet(args []string) {
 			"========================================" +
 			colorReset,
 	)
+}
+
+// ------------------------------------------------------------
+// SECURE ZIP EXTRACTION
+// ------------------------------------------------------------
+
+func extractZIPSecurely(
+	zipPath string,
+	destination string,
+) error {
+	reader, err := zip.OpenReader(zipPath)
+
+	if err != nil {
+		return fmt.Errorf(
+			"open ZIP archive: %w",
+			err,
+		)
+	}
+
+	defer reader.Close()
+
+	destinationAbs, err := filepath.Abs(destination)
+
+	if err != nil {
+		return fmt.Errorf(
+			"resolve installation directory: %w",
+			err,
+		)
+	}
+
+	destinationAbs = filepath.Clean(
+		destinationAbs,
+	)
+
+	for _, file := range reader.File {
+		name := file.Name
+
+		if name == "" {
+			continue
+		}
+
+		// ZIP paths conventionally use '/' even on Windows.
+		name = strings.ReplaceAll(
+			name,
+			"/",
+			string(os.PathSeparator),
+		)
+
+		// Never allow absolute paths.
+		if filepath.IsAbs(name) {
+			return fmt.Errorf(
+				"ZIP entry uses an absolute path: %q",
+				file.Name,
+			)
+		}
+
+		targetPath := filepath.Join(
+			destinationAbs,
+			name,
+		)
+
+		targetAbs, err := filepath.Abs(
+			targetPath,
+		)
+
+		if err != nil {
+			return fmt.Errorf(
+				"resolve ZIP entry %q: %w",
+				file.Name,
+				err,
+			)
+		}
+
+		targetAbs = filepath.Clean(
+			targetAbs,
+		)
+
+		relative, err := filepath.Rel(
+			destinationAbs,
+			targetAbs,
+		)
+
+		if err != nil {
+			return fmt.Errorf(
+				"validate ZIP entry %q: %w",
+				file.Name,
+				err,
+			)
+		}
+
+		// Prevent ZIP Slip:
+		//
+		// ../file
+		// ../../file
+		// etc.
+		if relative == ".." ||
+			strings.HasPrefix(
+				relative,
+				".."+string(os.PathSeparator),
+			) ||
+			filepath.IsAbs(relative) {
+
+			return fmt.Errorf(
+				"ZIP entry attempts to escape installation directory: %q",
+				file.Name,
+			)
+		}
+
+		mode := file.Mode()
+
+		// Do not extract symbolic links.
+		if mode&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"ZIP entry contains unsupported symbolic link: %q",
+				file.Name,
+			)
+		}
+
+		// Do not extract special files.
+		if mode&os.ModeNamedPipe != 0 ||
+			mode&os.ModeSocket != 0 ||
+			mode&os.ModeDevice != 0 {
+
+			return fmt.Errorf(
+				"ZIP entry contains unsupported special file: %q",
+				file.Name,
+			)
+		}
+
+		isDirectory := file.FileInfo().IsDir()
+
+		if isDirectory {
+			if err := os.MkdirAll(
+				targetAbs,
+				0755,
+			); err != nil {
+				return fmt.Errorf(
+					"create ZIP directory %q: %w",
+					file.Name,
+					err,
+				)
+			}
+
+			continue
+		}
+
+		if err := os.MkdirAll(
+			filepath.Dir(targetAbs),
+			0755,
+		); err != nil {
+			return fmt.Errorf(
+				"create directory for ZIP entry %q: %w",
+				file.Name,
+				err,
+			)
+		}
+
+		source, err := file.Open()
+
+		if err != nil {
+			return fmt.Errorf(
+				"open ZIP entry %q: %w",
+				file.Name,
+				err,
+			)
+		}
+
+		output, err := os.OpenFile(
+			targetAbs,
+			os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+			0644,
+		)
+
+		if err != nil {
+			_ = source.Close()
+
+			return fmt.Errorf(
+				"create extracted file %q: %w",
+				file.Name,
+				err,
+			)
+		}
+
+		_, copyErr := io.Copy(
+			output,
+			source,
+		)
+
+		closeOutputErr := output.Close()
+		closeSourceErr := source.Close()
+
+		if copyErr != nil {
+			_ = os.Remove(targetAbs)
+
+			return fmt.Errorf(
+				"extract ZIP entry %q: %w",
+				file.Name,
+				copyErr,
+			)
+		}
+
+		if closeOutputErr != nil {
+			_ = os.Remove(targetAbs)
+
+			return fmt.Errorf(
+				"close extracted file %q: %w",
+				file.Name,
+				closeOutputErr,
+			)
+		}
+
+		if closeSourceErr != nil {
+			_ = os.Remove(targetAbs)
+
+			return fmt.Errorf(
+				"close ZIP entry %q: %w",
+				file.Name,
+				closeSourceErr,
+			)
+		}
+	}
+
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -987,12 +1287,12 @@ func validateManifest(
 		manifest.Binary,
 	) != manifest.Binary ||
 		filepath.IsAbs(
-		manifest.Binary,
-	) ||
+			manifest.Binary,
+		) ||
 		strings.ContainsAny(
-		manifest.Binary,
-		`/\`,
-	) {
+			manifest.Binary,
+			"/\\",
+		) {
 		return fmt.Errorf(
 			"manifest binary must be a simple filename",
 		)
@@ -2286,6 +2586,17 @@ func handleAbout(args []string) {
 		colorReset,
 	)
 
+	if strings.EqualFold(
+		filepath.Ext(manifest.Binary),
+		".zip",
+	) {
+		fmt.Printf(
+			"Type:         %sZIP archive%s\n",
+			colorCyan,
+			colorReset,
+		)
+	}
+
 	if strings.TrimSpace(
 		manifest.Description,
 	) != "" {
@@ -2355,6 +2666,9 @@ func printHelp() {
 	fmt.Println("  get <package>")
 	fmt.Println(
 		"      Install the latest version of a package.",
+	)
+	fmt.Println(
+		"      ZIP packages are extracted automatically.",
 	)
 
 	fmt.Println()
