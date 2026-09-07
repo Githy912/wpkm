@@ -656,19 +656,6 @@ func handleGet(args []string) {
 		colorReset,
 	)
 
-	isZIP := strings.EqualFold(
-		filepath.Ext(manifest.Binary),
-		".zip",
-	)
-
-	if isZIP {
-		fmt.Printf(
-			"Type: %sZIP archive%s\n",
-			colorCyan,
-			colorReset,
-		)
-	}
-
 	fmt.Println()
 
 	binaryURL := registryPackageURL(
@@ -810,58 +797,66 @@ func handleGet(args []string) {
 		packageName,
 	)
 
+	packagesDir := filepath.Dir(installDir)
+
 	if err := os.MkdirAll(
-		installDir,
+		packagesDir,
 		0755,
 	); err != nil {
 		errorf(
-			"create installation directory: %v",
+			"create package directory: %v",
 			err,
 		)
 		return
 	}
 
-	// --------------------------------------------------------
-	// ZIP INSTALLATION
-	// --------------------------------------------------------
+	stagingDir, err := os.MkdirTemp(
+		packagesDir,
+		"."+packageName+".wpkm-staging-*",
+	)
+
+	if err != nil {
+		errorf(
+			"create installation staging directory: %v",
+			err,
+		)
+		return
+	}
+
+	stagingActive := true
+	defer func() {
+		if stagingActive {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+
+	isZIP := strings.EqualFold(
+		filepath.Ext(manifest.Binary),
+		".zip",
+	)
 
 	if isZIP {
-		stopProgress = startIndeterminateProgress(
-			"Extracting ZIP package...",
+		infof(
+			"ZIP package detected. Extracting securely...",
 		)
 
-		err := extractZIPSecurely(
+		if err := extractZIPSecure(
 			tempBinary,
-			installDir,
-		)
-
-		stopProgress()
-
-		if err != nil {
+			stagingDir,
+		); err != nil {
 			errorf(
 				"extract ZIP package: %v",
 				err,
 			)
-
-			warningf(
-				"The ZIP package was verified but could not be extracted.",
-			)
-
 			return
 		}
 
 		successf(
-			"ZIP package extracted.",
+			"ZIP package extracted successfully.",
 		)
-
 	} else {
-
-		// ----------------------------------------------------
-		// NORMAL FILE INSTALLATION
-		// ----------------------------------------------------
-
 		installedBinary := filepath.Join(
-			installDir,
+			stagingDir,
 			manifest.Binary,
 		)
 
@@ -870,7 +865,7 @@ func handleGet(args []string) {
 			installedBinary,
 		); err != nil {
 			errorf(
-				"install package: %v",
+				"stage package: %v",
 				err,
 			)
 			return
@@ -878,7 +873,7 @@ func handleGet(args []string) {
 	}
 
 	manifestPath := filepath.Join(
-		installDir,
+		stagingDir,
 		"manifest.json",
 	)
 
@@ -888,24 +883,14 @@ func handleGet(args []string) {
 		0644,
 	); err != nil {
 		errorf(
-			"install manifest: %v",
+			"stage manifest: %v",
 			err,
 		)
-
-		if !isZIP {
-			_ = os.Remove(
-				filepath.Join(
-					installDir,
-					manifest.Binary,
-				),
-			)
-		}
-
 		return
 	}
 
 	hashPath := filepath.Join(
-		installDir,
+		stagingDir,
 		"SHA3-512",
 	)
 
@@ -915,22 +900,29 @@ func handleGet(args []string) {
 		0644,
 	); err != nil {
 		errorf(
-			"install SHA3-512 file: %v",
+			"stage SHA3-512 file: %v",
 			err,
 		)
-
-		if !isZIP {
-			_ = os.Remove(
-				filepath.Join(
-					installDir,
-					manifest.Binary,
-				),
-			)
-		}
-
-		_ = os.Remove(manifestPath)
-
 		return
+	}
+
+	if err := replaceInstalledPackage(
+		stagingDir,
+		installDir,
+	); err != nil {
+		errorf(
+			"install package: %v",
+			err,
+		)
+		return
+	}
+
+	stagingActive = false
+
+	if isZIP {
+		successf(
+			"ZIP package extracted and installed.",
+		)
 	}
 
 	fmt.Println()
@@ -970,14 +962,6 @@ func handleGet(args []string) {
 		colorReset,
 	)
 
-	if isZIP {
-		fmt.Printf(
-			"Type: %sZIP archive%s\n",
-			colorCyan,
-			colorReset,
-		)
-	}
-
 	fmt.Printf(
 		"Location: %s%s%s\n",
 		colorCyan,
@@ -1007,223 +991,172 @@ func handleGet(args []string) {
 }
 
 // ------------------------------------------------------------
-// SECURE ZIP EXTRACTION
+// ZIP INSTALLATION HELPERS
 // ------------------------------------------------------------
 
-func extractZIPSecurely(
+func extractZIPSecure(
 	zipPath string,
 	destination string,
 ) error {
 	reader, err := zip.OpenReader(zipPath)
-
 	if err != nil {
-		return fmt.Errorf(
-			"open ZIP archive: %w",
-			err,
-		)
+		return fmt.Errorf("open ZIP: %w", err)
 	}
-
 	defer reader.Close()
 
-	destinationAbs, err := filepath.Abs(destination)
-
+	cleanDestination, err := filepath.Abs(destination)
 	if err != nil {
-		return fmt.Errorf(
-			"resolve installation directory: %w",
-			err,
-		)
+		return fmt.Errorf("resolve ZIP destination: %w", err)
 	}
 
-	destinationAbs = filepath.Clean(
-		destinationAbs,
-	)
-
-	for _, file := range reader.File {
-		name := file.Name
+	for _, entry := range reader.File {
+		name := strings.ReplaceAll(entry.Name, "\\", "/")
 
 		if name == "" {
 			continue
 		}
 
-		// ZIP paths conventionally use '/' even on Windows.
-		name = strings.ReplaceAll(
-			name,
-			"/",
-			string(os.PathSeparator),
-		)
+		if strings.HasPrefix(name, "/") ||
+			filepath.IsAbs(filepath.FromSlash(name)) {
+			return fmt.Errorf("ZIP entry has an absolute path: %q", entry.Name)
+		}
 
-		// Never allow absolute paths.
-		if filepath.IsAbs(name) {
-			return fmt.Errorf(
-				"ZIP entry uses an absolute path: %q",
-				file.Name,
-			)
+		cleanName := filepath.Clean(filepath.FromSlash(name))
+
+		if cleanName == "." || cleanName == ".." ||
+			strings.HasPrefix(cleanName, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("ZIP entry escapes installation directory: %q", entry.Name)
 		}
 
 		targetPath := filepath.Join(
-			destinationAbs,
-			name,
-		)
-
-		targetAbs, err := filepath.Abs(
-			targetPath,
-		)
-
-		if err != nil {
-			return fmt.Errorf(
-				"resolve ZIP entry %q: %w",
-				file.Name,
-				err,
-			)
-		}
-
-		targetAbs = filepath.Clean(
-			targetAbs,
+			cleanDestination,
+			cleanName,
 		)
 
 		relative, err := filepath.Rel(
-			destinationAbs,
-			targetAbs,
+			cleanDestination,
+			targetPath,
 		)
-
 		if err != nil {
-			return fmt.Errorf(
-				"validate ZIP entry %q: %w",
-				file.Name,
-				err,
-			)
+			return fmt.Errorf("validate ZIP entry %q: %w", entry.Name, err)
 		}
 
-		// Prevent ZIP Slip:
-		//
-		// ../file
-		// ../../file
-		// etc.
 		if relative == ".." ||
-			strings.HasPrefix(
-				relative,
-				".."+string(os.PathSeparator),
-			) ||
+			strings.HasPrefix(relative, ".."+string(os.PathSeparator)) ||
 			filepath.IsAbs(relative) {
-
-			return fmt.Errorf(
-				"ZIP entry attempts to escape installation directory: %q",
-				file.Name,
-			)
+			return fmt.Errorf("ZIP entry escapes installation directory: %q", entry.Name)
 		}
 
-		mode := file.Mode()
+		mode := entry.FileInfo().Mode()
 
-		// Do not extract symbolic links.
 		if mode&os.ModeSymlink != 0 {
-			return fmt.Errorf(
-				"ZIP entry contains unsupported symbolic link: %q",
-				file.Name,
-			)
+			return fmt.Errorf("ZIP entry is a symlink and is not allowed: %q", entry.Name)
 		}
 
-		// Do not extract special files.
 		if mode&os.ModeNamedPipe != 0 ||
 			mode&os.ModeSocket != 0 ||
-			mode&os.ModeDevice != 0 {
-
-			return fmt.Errorf(
-				"ZIP entry contains unsupported special file: %q",
-				file.Name,
-			)
+			mode&os.ModeDevice != 0 ||
+			mode&os.ModeCharDevice != 0 {
+			return fmt.Errorf("ZIP entry is a special filesystem object and is not allowed: %q", entry.Name)
 		}
 
-		isDirectory := file.FileInfo().IsDir()
-
-		if isDirectory {
-			if err := os.MkdirAll(
-				targetAbs,
-				0755,
-			); err != nil {
-				return fmt.Errorf(
-					"create ZIP directory %q: %w",
-					file.Name,
-					err,
-				)
+		if entry.FileInfo().IsDir() || strings.HasSuffix(name, "/") {
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return fmt.Errorf("create ZIP directory %q: %w", entry.Name, err)
 			}
-
 			continue
 		}
 
-		if err := os.MkdirAll(
-			filepath.Dir(targetAbs),
-			0755,
-		); err != nil {
-			return fmt.Errorf(
-				"create directory for ZIP entry %q: %w",
-				file.Name,
-				err,
-			)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fmt.Errorf("create ZIP parent directory for %q: %w", entry.Name, err)
 		}
 
-		source, err := file.Open()
-
+		input, err := entry.Open()
 		if err != nil {
-			return fmt.Errorf(
-				"open ZIP entry %q: %w",
-				file.Name,
-				err,
-			)
+			return fmt.Errorf("open ZIP entry %q: %w", entry.Name, err)
 		}
 
 		output, err := os.OpenFile(
-			targetAbs,
+			targetPath,
 			os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
 			0644,
 		)
-
 		if err != nil {
-			_ = source.Close()
-
-			return fmt.Errorf(
-				"create extracted file %q: %w",
-				file.Name,
-				err,
-			)
+			_ = input.Close()
+			return fmt.Errorf("create extracted file %q: %w", entry.Name, err)
 		}
 
-		_, copyErr := io.Copy(
-			output,
-			source,
-		)
-
+		_, copyErr := io.Copy(output, input)
 		closeOutputErr := output.Close()
-		closeSourceErr := source.Close()
+		closeInputErr := input.Close()
 
 		if copyErr != nil {
-			_ = os.Remove(targetAbs)
-
-			return fmt.Errorf(
-				"extract ZIP entry %q: %w",
-				file.Name,
-				copyErr,
-			)
+			return fmt.Errorf("extract ZIP entry %q: %w", entry.Name, copyErr)
 		}
 
 		if closeOutputErr != nil {
-			_ = os.Remove(targetAbs)
-
-			return fmt.Errorf(
-				"close extracted file %q: %w",
-				file.Name,
-				closeOutputErr,
-			)
+			return fmt.Errorf("close extracted file %q: %w", entry.Name, closeOutputErr)
 		}
 
-		if closeSourceErr != nil {
-			_ = os.Remove(targetAbs)
-
-			return fmt.Errorf(
-				"close ZIP entry %q: %w",
-				file.Name,
-				closeSourceErr,
-			)
+		if closeInputErr != nil {
+			return fmt.Errorf("close ZIP entry %q: %w", entry.Name, closeInputErr)
 		}
+	}
+
+	return nil
+}
+
+func replaceInstalledPackage(
+	stagingDir string,
+	installDir string,
+) error {
+	parentDir := filepath.Dir(installDir)
+	backupDir := filepath.Join(
+		parentDir,
+		"."+filepath.Base(installDir)+".wpkm-backup-*",
+	)
+
+	var existing bool
+
+	if _, err := os.Stat(installDir); err == nil {
+		existing = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect existing package: %w", err)
+	}
+
+	if !existing {
+		if err := os.Rename(stagingDir, installDir); err != nil {
+			return fmt.Errorf("activate extracted package: %w", err)
+		}
+		return nil
+	}
+
+	backupPath, err := os.MkdirTemp(
+		parentDir,
+		backupDir,
+	)
+	if err != nil {
+		return fmt.Errorf("create package backup directory: %w", err)
+	}
+
+	if err := os.Remove(backupPath); err != nil {
+		return fmt.Errorf("prepare package backup path: %w", err)
+	}
+
+	if err := os.Rename(installDir, backupPath); err != nil {
+		return fmt.Errorf("move existing package to backup: %w", err)
+	}
+
+	if err := os.Rename(stagingDir, installDir); err != nil {
+		_ = os.Rename(backupPath, installDir)
+		return fmt.Errorf("activate extracted package: %w", err)
+	}
+
+	if err := os.RemoveAll(backupPath); err != nil {
+		warningf(
+			"could not remove previous package backup: %v",
+			err,
+		)
 	}
 
 	return nil
@@ -1291,7 +1224,7 @@ func validateManifest(
 		) ||
 		strings.ContainsAny(
 			manifest.Binary,
-			"/\\",
+			`/\`,
 		) {
 		return fmt.Errorf(
 			"manifest binary must be a simple filename",
@@ -1956,12 +1889,74 @@ func fetchRegistryPackages() (
 	targetURL := githubAPIBase +
 		"/contents/packages"
 
-	response, err := httpClient.Get(
-		targetURL,
+	requestRegistry := func(token string) (*http.Response, error) {
+		request, err := http.NewRequest(
+			http.MethodGet,
+			targetURL,
+			nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		request.Header.Set(
+			"Accept",
+			"application/vnd.github+json",
+		)
+		request.Header.Set(
+			"X-GitHub-Api-Version",
+			"2026-03-10",
+		)
+		request.Header.Set(
+			"User-Agent",
+			"wpkm/"+version,
+		)
+
+		if token != "" {
+			request.Header.Set(
+				"Authorization",
+				"Bearer "+token,
+			)
+		}
+
+		return httpClient.Do(request)
+	}
+
+	token := strings.TrimSpace(
+		os.Getenv("WPKM_GITHUB_TOKEN"),
 	)
 
+	response, err := requestRegistry(token)
 	if err != nil {
 		return nil, err
+	}
+
+	if response.StatusCode == http.StatusForbidden ||
+		response.StatusCode == http.StatusTooManyRequests {
+		_ = response.Body.Close()
+
+		// The public GitHub API is limited to a small number of requests
+		// per hour. If the anonymous request is rate-limited, reuse the
+		// same stored GitHub credential used by `wpkm push` and retry once.
+		if token == "" {
+			token, err = auth.GetOrPrompt()
+			if err != nil {
+				return nil, fmt.Errorf(
+					"GitHub API rate limit reached (HTTP %d); authentication is required for registry search: %w",
+					response.StatusCode,
+					err,
+				)
+			}
+
+			token = strings.TrimSpace(token)
+		}
+
+		if token != "" {
+			response, err = requestRegistry(token)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	defer response.Body.Close()
@@ -2586,17 +2581,6 @@ func handleAbout(args []string) {
 		colorReset,
 	)
 
-	if strings.EqualFold(
-		filepath.Ext(manifest.Binary),
-		".zip",
-	) {
-		fmt.Printf(
-			"Type:         %sZIP archive%s\n",
-			colorCyan,
-			colorReset,
-		)
-	}
-
 	if strings.TrimSpace(
 		manifest.Description,
 	) != "" {
@@ -2666,9 +2650,6 @@ func printHelp() {
 	fmt.Println("  get <package>")
 	fmt.Println(
 		"      Install the latest version of a package.",
-	)
-	fmt.Println(
-		"      ZIP packages are extracted automatically.",
 	)
 
 	fmt.Println()
